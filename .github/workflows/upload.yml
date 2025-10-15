@@ -27,17 +27,24 @@ jobs:
       - name: Restore credential files
         shell: bash
         run: |
-          printf '%s' "${{ secrets.CLIENT_SECRET_JSON }}" > client_secret.json
-          printf '%s' "${{ secrets.TOKEN_JSON }}" > token.json
+          echo "Writing client_secret.json..."
+          cat > client_secret.json <<'EOF'
+          ${{ secrets.CLIENT_SECRET_JSON }}
+          EOF
+
+          echo "Writing token.json..."
+          cat > token.json <<'EOF'
+          ${{ secrets.TOKEN_JSON }}
+          EOF
 
       - name: Debug JSON contents
         shell: bash
         run: |
           echo "client_secret.json starts with:"
-          head -c 100 client_secret.json || true
+          head -c 200 client_secret.json || true
           echo ""
           echo "token.json starts with:"
-          head -c 100 token.json || true
+          head -c 200 token.json || true
           echo ""
 
       - name: Run upload script
