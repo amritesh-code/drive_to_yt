@@ -30,5 +30,15 @@ jobs:
           printf '%s' "${{ secrets.CLIENT_SECRET_JSON }}" > client_secret.json
           printf '%s' "${{ secrets.TOKEN_JSON }}" > token.json
 
+      - name: Debug JSON contents
+        shell: bash
+        run: |
+          echo "client_secret.json starts with:"
+          head -c 100 client_secret.json || true
+          echo ""
+          echo "token.json starts with:"
+          head -c 100 token.json || true
+          echo ""
+
       - name: Run upload script
         run: python main.py
