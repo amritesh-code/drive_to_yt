@@ -69,9 +69,9 @@ def upload_to_youtube(filename, title):
     body = {
         "snippet": {
             "title": title,
-            "description": "Auto-uploaded via Drive to YouTube script.",
+            "description": "",
             "tags": [],
-            "categoryId": "22",
+            "categoryId": "28",
         },
         "status": {"privacyStatus": privacy_tag},
     }

@@ -2,8 +2,8 @@ name: Drive to YouTube Upload
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # runs every 12 hours
-  workflow_dispatch:        # allows manual trigger
+    - cron: '0 */12 * * *'  
+  workflow_dispatch:        
 
 jobs:
   upload:
@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -25,27 +27,17 @@ jobs:
           pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
 
       - name: Restore credential files
-        shell: bash
         run: |
-          echo "Writing client_secret.json..."
-          cat > client_secret.json <<'EOF'
-          ${{ secrets.CLIENT_SECRET_JSON }}
-          EOF
-
-          echo "Writing token.json..."
-          cat > token.json <<'EOF'
-          ${{ secrets.TOKEN_JSON }}
-          EOF
-
-      - name: Debug JSON contents
-        shell: bash
-        run: |
-          echo "client_secret.json starts with:"
-          head -c 200 client_secret.json || true
-          echo ""
-          echo "token.json starts with:"
-          head -c 200 token.json || true
-          echo ""
+          echo '${{ secrets.CLIENT_SECRET_JSON }}' > client_secret.json
+          echo '${{ secrets.TOKEN_JSON }}' > token.json
 
       - name: Run upload script
         run: python main.py
+
+      - name: Commit uploaded.json updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add uploaded.json
+          git commit -m "update: uploaded.json after upload run" || echo "No changes to commit"
+          git push
