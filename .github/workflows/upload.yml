@@ -25,9 +25,10 @@ jobs:
           pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2
 
       - name: Restore credential files
+        shell: bash
         run: |
-          echo "${{ secrets.CLIENT_SECRET_JSON }}" > client_secret.json
-          echo "${{ secrets.TOKEN_JSON }}" > token.json
+          printf '%s' "${{ secrets.CLIENT_SECRET_JSON }}" > client_secret.json
+          printf '%s' "${{ secrets.TOKEN_JSON }}" > token.json
 
       - name: Run upload script
         run: python main.py
