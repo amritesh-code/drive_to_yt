@@ -11,7 +11,7 @@ from google.oauth2.credentials import Credentials
 
 from sheet_logger import append_video_to_sheet, build_youtube_video_url
 
-id_folder = os.getenv("DRIVE_FOLDER_ID", "1ALmBGywBExPRIC7TGWNIXtbMasNGSWZE")
+id_folder = os.getenv("DRIVE_FOLDER_ID", "1G_wFFQW7N33-nGRJLUH8198NLwU8XYIx")
 privacy_tag = os.getenv("YOUTUBE_PRIVACY", "unlisted")
 file_check = "uploaded.json"
 oAuth = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
