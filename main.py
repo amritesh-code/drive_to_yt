@@ -123,6 +123,23 @@ def safe_name(name):
     return "".join(c for c in name if c.isalnum() or c in " .-_()").strip()
 
 
+def normalize_title(name):
+    return os.path.splitext((name or "").strip())[0].strip().lower()
+
+
+def find_tracked_entry(tracked, file_id, title):
+    if file_id in tracked:
+        return file_id, tracked[file_id], "file id"
+
+    normalized_title = normalize_title(title)
+    for tracked_id, entry in tracked.items():
+        entry_name = entry.get("title") or entry.get("name", "")
+        if normalize_title(entry_name) == normalized_title:
+            return tracked_id, entry, "title"
+
+    return None, None, None
+
+
 def is_dry_run():
     return os.getenv("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -150,9 +167,13 @@ def main():
     for f in files:
         fid = f["id"]
         name = f.get("name", f"{fid}.zip")
+        title = os.path.splitext(name)[0]
 
-        if fid in tracked:
-            print(f"Skipping already uploaded: {name}")
+        tracked_id, tracked_entry, match_reason = find_tracked_entry(tracked, fid, title)
+        if tracked_entry:
+            print(
+                f"Skipping already uploaded ({match_reason} match: {tracked_id}): {name}"
+            )
             continue
 
         safe_filename = safe_name(name)
@@ -173,7 +194,6 @@ def main():
                 continue
             
             video_name = os.path.basename(video_path)
-            title = os.path.splitext(name)[0]
             
             print(f"Found video: {video_name}")
             if dry_run:
@@ -189,6 +209,7 @@ def main():
 
             tracked[fid] = {
                 "name": name,
+                "title": title,
                 "video_file": video_name,
                 "youtube_id": vid_id,
                 "video_url": video_url,
