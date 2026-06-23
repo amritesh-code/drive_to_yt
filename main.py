@@ -5,7 +5,10 @@ import time
 import zipfile
 import shutil
 import glob
+import ssl
+import http.client
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.oauth2.credentials import Credentials
 
@@ -61,13 +64,37 @@ def list_zip_files_in_folder(folder_id):
     return files
 
 
+# Transient failures (dropped connections, 5xx) that are safe to retry.
+RETRIABLE_EXCEPTIONS = (OSError, ssl.SSLError, http.client.HTTPException)
+RETRIABLE_STATUS = {500, 502, 503, 504}
+MAX_RETRIES = 5
+
+
+def next_chunk_with_retry(request, label):
+    retry = 0
+    while True:
+        try:
+            return request.next_chunk()
+        except HttpError as e:
+            if getattr(e, "resp", None) is None or e.resp.status not in RETRIABLE_STATUS:
+                raise
+        except RETRIABLE_EXCEPTIONS:
+            pass
+        retry += 1
+        if retry > MAX_RETRIES:
+            raise
+        wait = min(2 ** retry, 60)
+        print(f"{label}: transient error, retrying in {wait}s ({retry}/{MAX_RETRIES})")
+        time.sleep(wait)
+
+
 def download_file(file_id, destination_path):
     request = drive_service.files().get_media(fileId=file_id)
     with io.FileIO(destination_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
         while not done:
-            status, done = downloader.next_chunk()
+            status, done = next_chunk_with_retry(downloader, "Download")
             if status:
                 print(f"Download {int(status.progress() * 100)}%")
 
@@ -97,7 +124,7 @@ def find_video_in_extracted(extract_dir):
 
 
 def upload_to_youtube(filename, title):
-    media = MediaFileUpload(filename, chunksize=-1, resumable=True)
+    media = MediaFileUpload(filename, chunksize=50 * 1024 * 1024, resumable=True)
     body = {
         "snippet": {
             "title": title,
@@ -113,7 +140,7 @@ def upload_to_youtube(filename, title):
     )
     response = None
     while response is None:
-        status, response = request.next_chunk()
+        status, response = next_chunk_with_retry(request, "Upload")
         if status:
             print(f"Upload {int(status.progress() * 100)}%")
     return response.get("id")
@@ -123,8 +150,21 @@ def safe_name(name):
     return "".join(c for c in name if c.isalnum() or c in " .-_()").strip()
 
 
+KNOWN_EXTENSIONS = (".zip", ".mp4", ".mkv", ".avi", ".mov")
+
+
 def normalize_title(name):
-    return os.path.splitext((name or "").strip())[0].strip().lower()
+    text = (name or "").strip()
+    stripped = True
+    while stripped:
+        stripped = False
+        lowered = text.lower()
+        for ext in KNOWN_EXTENSIONS:
+            if lowered.endswith(ext):
+                text = text[: -len(ext)]
+                stripped = True
+                break
+    return text.strip().lower()
 
 
 def find_tracked_entry(tracked, file_id, title):
@@ -142,6 +182,28 @@ def find_tracked_entry(tracked, file_id, title):
 
 def is_dry_run():
     return os.getenv("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# YouTube returns these reasons when the daily upload quota / limit is hit.
+# When that happens there is no point trying the remaining videos today, so we
+# stop cleanly (exit 0) and let the next scheduled run pick up where we left off.
+QUOTA_REASONS = {
+    "quotaexceeded",
+    "dailylimitexceeded",
+    "uploadlimitexceeded",
+    "ratelimitexceeded",
+    "userratelimitexceeded",
+}
+
+
+def is_quota_error(error):
+    if not isinstance(error, HttpError):
+        return False
+    if getattr(error, "resp", None) is not None and error.resp.status == 403:
+        text = (getattr(error, "content", b"") or b"").decode("utf-8", "ignore").lower()
+        if any(reason in text for reason in QUOTA_REASONS):
+            return True
+    return False
 
 
 def cleanup_temp(paths):
@@ -230,6 +292,12 @@ def main():
                 )
 
         except Exception as e:
+            if is_quota_error(e):
+                print(
+                    "YouTube daily upload quota reached. Stopping for today; "
+                    "remaining videos will be picked up on the next run."
+                )
+                break
             print(f"Error processing {name}: {str(e)}")
 
         finally:
