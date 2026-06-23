@@ -7,6 +7,7 @@ import shutil
 import glob
 import ssl
 import http.client
+import rarfile
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -22,6 +23,12 @@ temp_dir = os.getenv("TEMP_EXTRACT_DIR", "temp_extract")
 spreadsheet_id = os.getenv(
     "GOOGLE_SHEET_ID", "1arGs7WTgCAfxPqWEiqHwEQQituhAxkY8rSu3QsNhcyM"
 )
+
+# Let rarfile auto-detect unrar/unar/bsdtar/7z, but allow an explicit override
+# (handy on Windows where the tool is not on PATH).
+_unrar_tool = os.getenv("UNRAR_TOOL")
+if _unrar_tool:
+    rarfile.UNRAR_TOOL = _unrar_tool
 
 creds = Credentials.from_authorized_user_file(oAuth, scopes=None)
 drive_service = build("drive", "v3", credentials=creds)
@@ -43,8 +50,14 @@ def save_tracked(d):
         json.dump(d, f, indent=2)
 
 
-def list_zip_files_in_folder(folder_id):
-    query = f"'{folder_id}' in parents and (mimeType='application/zip' or mimeType='application/x-zip-compressed' or name contains '.zip') and trashed=false"
+def list_archive_files_in_folder(folder_id):
+    query = (
+        f"'{folder_id}' in parents and trashed=false and ("
+        "mimeType='application/zip' or mimeType='application/x-zip-compressed' or "
+        "mimeType='application/x-rar-compressed' or mimeType='application/vnd.rar' or "
+        "mimeType='application/x-compressed' or "
+        "name contains '.zip' or name contains '.rar')"
+    )
     files, page_token = [], None
     while True:
         resp = (
@@ -99,10 +112,14 @@ def download_file(file_id, destination_path):
                 print(f"Download {int(status.progress() * 100)}%")
 
 
-def extract_zip(zip_path, extract_to):
+def extract_archive(archive_path, extract_to):
     os.makedirs(extract_to, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_to)
+    if archive_path.lower().endswith(".rar"):
+        with rarfile.RarFile(archive_path) as archive:
+            archive.extractall(extract_to)
+    else:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            archive.extractall(extract_to)
     return extract_to
 
 
@@ -219,11 +236,11 @@ def cleanup_temp(paths):
 
 def main():
     tracked = load_tracked()
-    files = list_zip_files_in_folder(id_folder)
+    files = list_archive_files_in_folder(id_folder)
     dry_run = is_dry_run()
 
     if not files:
-        print("No zip files found in folder.")
+        print("No archive files found in folder.")
         return
 
     for f in files:
@@ -242,17 +259,17 @@ def main():
         zip_path = os.path.join(os.getcwd(), safe_filename)
         extract_dir = os.path.join(os.getcwd(), temp_dir, fid)
 
-        print(f"Processing zip: {name}")
+        print(f"Processing archive: {name}")
         try:
-            print("Downloading zip file...")
+            print("Downloading archive...")
             download_file(fid, zip_path)
 
-            print("Extracting zip file...")
-            extract_zip(zip_path, extract_dir)
-            
+            print("Extracting archive...")
+            extract_archive(zip_path, extract_dir)
+
             video_path = find_video_in_extracted(extract_dir)
             if not video_path:
-                print(f"No video file found in zip: {name}")
+                print(f"No video file found in archive: {name}")
                 continue
             
             video_name = os.path.basename(video_path)
