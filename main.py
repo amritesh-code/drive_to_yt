@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import os
 import json
@@ -7,6 +9,9 @@ import shutil
 import glob
 import ssl
 import http.client
+from functools import lru_cache
+from typing import Any, Optional
+
 import rarfile
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -30,12 +35,24 @@ _unrar_tool = os.getenv("UNRAR_TOOL")
 if _unrar_tool:
     rarfile.UNRAR_TOOL = _unrar_tool
 
-creds = Credentials.from_authorized_user_file(oAuth, scopes=None)
-drive_service = build("drive", "v3", credentials=creds)
-youtube_service = build("youtube", "v3", credentials=creds)
+# Build the API clients lazily so importing this module (e.g. for tests) does
+# not require a valid token.json on disk. lru_cache makes each a singleton.
+@lru_cache(maxsize=None)
+def _load_credentials() -> Credentials:
+    return Credentials.from_authorized_user_file(oAuth, scopes=None)
 
 
-def load_tracked():
+@lru_cache(maxsize=None)
+def get_drive_service() -> Any:
+    return build("drive", "v3", credentials=_load_credentials())
+
+
+@lru_cache(maxsize=None)
+def get_youtube_service() -> Any:
+    return build("youtube", "v3", credentials=_load_credentials())
+
+
+def load_tracked() -> dict[str, Any]:
     if not os.path.exists(file_check):
         return {}
     try:
@@ -45,12 +62,12 @@ def load_tracked():
         return {}
 
 
-def save_tracked(d):
+def save_tracked(d: dict[str, Any]) -> None:
     with open(file_check, "w") as f:
         json.dump(d, f, indent=2)
 
 
-def list_archive_files_in_folder(folder_id):
+def list_archive_files_in_folder(folder_id: str) -> list[dict[str, Any]]:
     query = (
         f"'{folder_id}' in parents and trashed=false and ("
         "mimeType='application/zip' or mimeType='application/x-zip-compressed' or "
@@ -61,7 +78,8 @@ def list_archive_files_in_folder(folder_id):
     files, page_token = [], None
     while True:
         resp = (
-            drive_service.files()
+            get_drive_service()
+            .files()
             .list(
                 q=query,
                 fields="nextPageToken, files(id, name, mimeType, size)",
@@ -83,7 +101,7 @@ RETRIABLE_STATUS = {500, 502, 503, 504}
 MAX_RETRIES = 5
 
 
-def next_chunk_with_retry(request, label):
+def next_chunk_with_retry(request: Any, label: str) -> tuple[Any, Any]:
     retry = 0
     while True:
         try:
@@ -101,8 +119,8 @@ def next_chunk_with_retry(request, label):
         time.sleep(wait)
 
 
-def download_file(file_id, destination_path):
-    request = drive_service.files().get_media(fileId=file_id)
+def download_file(file_id: str, destination_path: str) -> None:
+    request = get_drive_service().files().get_media(fileId=file_id)
     with io.FileIO(destination_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -112,7 +130,7 @@ def download_file(file_id, destination_path):
                 print(f"Download {int(status.progress() * 100)}%")
 
 
-def extract_archive(archive_path, extract_to):
+def extract_archive(archive_path: str, extract_to: str) -> str:
     os.makedirs(extract_to, exist_ok=True)
     if archive_path.lower().endswith(".rar"):
         with rarfile.RarFile(archive_path) as archive:
@@ -123,7 +141,7 @@ def extract_archive(archive_path, extract_to):
     return extract_to
 
 
-def find_video_in_extracted(extract_dir):
+def find_video_in_extracted(extract_dir: str) -> Optional[str]:
     video_patterns = [
         os.path.join(extract_dir, "**", "video*.mp4"),
         os.path.join(extract_dir, "**", "*.mp4"),
@@ -140,7 +158,7 @@ def find_video_in_extracted(extract_dir):
     return None
 
 
-def upload_to_youtube(filename, title):
+def upload_to_youtube(filename: str, title: str) -> Optional[str]:
     media = MediaFileUpload(filename, chunksize=50 * 1024 * 1024, resumable=True)
     body = {
         "snippet": {
@@ -152,7 +170,7 @@ def upload_to_youtube(filename, title):
         "status": {"privacyStatus": privacy_tag},
     }
 
-    request = youtube_service.videos().insert(
+    request = get_youtube_service().videos().insert(
         part="snippet,status", body=body, media_body=media
     )
     response = None
@@ -163,14 +181,14 @@ def upload_to_youtube(filename, title):
     return response.get("id")
 
 
-def safe_name(name):
+def safe_name(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c in " .-_()").strip()
 
 
-KNOWN_EXTENSIONS = (".zip", ".mp4", ".mkv", ".avi", ".mov")
+KNOWN_EXTENSIONS = (".zip", ".rar", ".mp4", ".mkv", ".avi", ".mov")
 
 
-def normalize_title(name):
+def normalize_title(name: str) -> str:
     text = (name or "").strip()
     stripped = True
     while stripped:
@@ -184,7 +202,9 @@ def normalize_title(name):
     return text.strip().lower()
 
 
-def find_tracked_entry(tracked, file_id, title):
+def find_tracked_entry(
+    tracked: dict[str, Any], file_id: str, title: str
+) -> tuple[Optional[str], Optional[dict[str, Any]], Optional[str]]:
     if file_id in tracked:
         return file_id, tracked[file_id], "file id"
 
@@ -197,7 +217,7 @@ def find_tracked_entry(tracked, file_id, title):
     return None, None, None
 
 
-def is_dry_run():
+def is_dry_run() -> bool:
     return os.getenv("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -213,7 +233,7 @@ QUOTA_REASONS = {
 }
 
 
-def is_quota_error(error):
+def is_quota_error(error: BaseException) -> bool:
     if not isinstance(error, HttpError):
         return False
     if getattr(error, "resp", None) is not None and error.resp.status == 403:
@@ -223,7 +243,7 @@ def is_quota_error(error):
     return False
 
 
-def cleanup_temp(paths):
+def cleanup_temp(paths: list[str]) -> None:
     for path in paths:
         try:
             if os.path.isdir(path):
@@ -234,7 +254,7 @@ def cleanup_temp(paths):
             print(f"Warning: Could not remove {path}: {e}")
 
 
-def main():
+def main() -> None:
     tracked = load_tracked()
     files = list_archive_files_in_folder(id_folder)
     dry_run = is_dry_run()
