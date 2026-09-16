@@ -149,21 +149,23 @@ def find_video_in_extracted(extract_dir: str) -> Optional[str]:
         os.path.join(extract_dir, "**", "*.avi"),
         os.path.join(extract_dir, "**", "*.mov"),
     ]
-    
+
     for pattern in video_patterns:
         videos = glob.glob(pattern, recursive=True)
         if videos:
             return max(videos, key=os.path.getsize)
-    
+
     return None
 
 
-def upload_to_youtube(filename: str, title: str) -> Optional[str]:
+def upload_to_youtube(
+    filename: str, title: str, description: str = ""
+) -> Optional[str]:
     media = MediaFileUpload(filename, chunksize=50 * 1024 * 1024, resumable=True)
     body = {
         "snippet": {
             "title": title,
-            "description": "",
+            "description": description,
             "tags": [],
             "categoryId": "28",
         },
@@ -182,10 +184,30 @@ def upload_to_youtube(filename: str, title: str) -> Optional[str]:
 
 
 def safe_name(name: str) -> str:
-    return "".join(c for c in name if c.isalnum() or c in " .-_()").strip()
+    cleaned = "".join(c for c in name if c.isalnum() or c in " .-_()")
+    return cleaned.strip(" .")  # "", "." or ".." would make zip_path a directory
 
 
 KNOWN_EXTENSIONS = (".zip", ".rar", ".mp4", ".mkv", ".avi", ".mov")
+
+YOUTUBE_TITLE_LIMIT = 100  # a longer snippet.title is rejected with HTTP 400
+ELLIPSIS = "…"
+MAX_KEPT_SUFFIX = 20
+
+
+# These names end in a date segment ("..._15 Sept") worth keeping over the middle.
+def build_video_title(title: str, limit: int = YOUTUBE_TITLE_LIMIT) -> str:
+    cleaned = title.replace("<", "(").replace(">", ")").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+
+    head, sep, tail = cleaned.rpartition("_")
+    if sep and 0 < len(tail) <= MAX_KEPT_SUFFIX:
+        keep = limit - len(ELLIPSIS) - len(sep) - len(tail)
+        if keep > 0:
+            return cleaned[:keep].rstrip(" .,-_") + ELLIPSIS + sep + tail
+
+    return cleaned[: limit - len(ELLIPSIS)].rstrip(" .,-_") + ELLIPSIS
 
 
 def normalize_title(name: str) -> str:
@@ -202,17 +224,33 @@ def normalize_title(name: str) -> str:
     return text.strip().lower()
 
 
+def tracked_title_of(entry: dict[str, Any]) -> str:
+    return entry.get("title") or entry.get("name", "")
+
+
+# First entry wins, matching the scan this replaces.
+def build_title_index(
+    tracked: dict[str, Any]
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    index: dict[str, tuple[str, dict[str, Any]]] = {}
+    for tracked_id, entry in tracked.items():
+        index.setdefault(normalize_title(tracked_title_of(entry)), (tracked_id, entry))
+    return index
+
+
 def find_tracked_entry(
-    tracked: dict[str, Any], file_id: str, title: str
+    tracked: dict[str, Any],
+    file_id: str,
+    title: str,
+    title_index: Optional[dict[str, tuple[str, dict[str, Any]]]] = None,
 ) -> tuple[Optional[str], Optional[dict[str, Any]], Optional[str]]:
     if file_id in tracked:
         return file_id, tracked[file_id], "file id"
 
-    normalized_title = normalize_title(title)
-    for tracked_id, entry in tracked.items():
-        entry_name = entry.get("title") or entry.get("name", "")
-        if normalize_title(entry_name) == normalized_title:
-            return tracked_id, entry, "title"
+    index = build_title_index(tracked) if title_index is None else title_index
+    match = index.get(normalize_title(title))
+    if match:
+        return match[0], match[1], "title"
 
     return None, None, None
 
@@ -244,18 +282,24 @@ def is_quota_error(error: BaseException) -> bool:
 
 
 def cleanup_temp(paths: list[str]) -> None:
+    cwd = os.path.abspath(os.getcwd())
     for path in paths:
+        full = os.path.abspath(path)
+        if full == cwd or cwd.startswith(full + os.sep):
+            print(f"Warning: refusing to remove {full} (contains working directory)")
+            continue
         try:
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.isfile(path):
-                os.remove(path)
+            if os.path.isdir(full):
+                shutil.rmtree(full)
+            elif os.path.isfile(full):
+                os.remove(full)
         except Exception as e:
             print(f"Warning: Could not remove {path}: {e}")
 
 
 def main() -> None:
     tracked = load_tracked()
+    title_index = build_title_index(tracked)
     files = list_archive_files_in_folder(id_folder)
     dry_run = is_dry_run()
 
@@ -263,19 +307,26 @@ def main() -> None:
         print("No archive files found in folder.")
         return
 
+    uploaded_count = 0
+    skipped_count = 0
+    failures: list[tuple[str, str]] = []
+
     for f in files:
         fid = f["id"]
         name = f.get("name", f"{fid}.zip")
         title = os.path.splitext(name)[0]
 
-        tracked_id, tracked_entry, match_reason = find_tracked_entry(tracked, fid, title)
+        tracked_id, tracked_entry, match_reason = find_tracked_entry(
+            tracked, fid, title, title_index
+        )
         if tracked_entry:
             print(
                 f"Skipping already uploaded ({match_reason} match: {tracked_id}): {name}"
             )
+            skipped_count += 1
             continue
 
-        safe_filename = safe_name(name)
+        safe_filename = safe_name(name) or f"{fid}.zip"
         zip_path = os.path.join(os.getcwd(), safe_filename)
         extract_dir = os.path.join(os.getcwd(), temp_dir, fid)
 
@@ -290,25 +341,37 @@ def main() -> None:
             video_path = find_video_in_extracted(extract_dir)
             if not video_path:
                 print(f"No video file found in archive: {name}")
+                failures.append((name, "no video file inside archive"))
                 continue
-            
+
             video_name = os.path.basename(video_path)
-            
+
             print(f"Found video: {video_name}")
+
+            youtube_title = build_video_title(title)
+            # The untrimmed name survives in the description when the title is cut.
+            description = "" if youtube_title == title else title
+            if youtube_title != title:
+                print(
+                    f"Title is {len(title)} chars (YouTube allows "
+                    f"{YOUTUBE_TITLE_LIMIT}); uploading as: {youtube_title}"
+                )
+
             if dry_run:
-                print(f"Dry run: would upload to YouTube as: {title}")
+                print(f"Dry run: would upload to YouTube as: {youtube_title}")
                 print("Dry run: would append title and video link to Google Sheets.")
                 continue
 
-            print(f"Uploading to YouTube as: {title}")
-            
-            vid_id = upload_to_youtube(video_path, title)
+            print(f"Uploading to YouTube as: {youtube_title}")
+
+            vid_id = upload_to_youtube(video_path, youtube_title, description)
             print(f"Uploaded video id: {vid_id}")
             video_url = build_youtube_video_url(vid_id)
 
             tracked[fid] = {
                 "name": name,
                 "title": title,
+                "youtube_title": youtube_title,
                 "video_file": video_name,
                 "youtube_id": vid_id,
                 "video_url": video_url,
@@ -316,6 +379,10 @@ def main() -> None:
                 "sheet_logged": False,
             }
             save_tracked(tracked)
+            # So a duplicate title later in this same run is still recognised.
+            title_index.setdefault(normalize_title(title), (fid, tracked[fid]))
+
+            uploaded_count += 1
 
             try:
                 append_video_to_sheet(title, video_url, spreadsheet_id=spreadsheet_id)
@@ -336,9 +403,21 @@ def main() -> None:
                 )
                 break
             print(f"Error processing {name}: {str(e)}")
+            failures.append((name, str(e)))
 
         finally:
             cleanup_temp([zip_path, extract_dir])
+
+    print()
+    print(
+        f"Done: {uploaded_count} uploaded, {skipped_count} already tracked, "
+        f"{len(failures)} failed."
+    )
+    # Failed files never reach uploaded.json, so nothing else would surface them.
+    if failures:
+        print("Failed files:")
+        for failed_name, reason in failures:
+            print(f"  - {failed_name}: {reason}")
 
 
 if __name__ == "__main__":
